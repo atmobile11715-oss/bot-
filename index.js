@@ -1,190 +1,236 @@
 // index.js
-// npm install discord.js@14
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField } = require('discord.js');
+import fs from 'fs';
+import { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events } from 'discord.js';
+
+const token = process.env.DISCORD_TOKEN;
+if (!token) {
+  console.error('Please set DISCORD_TOKEN env variable');
+  process.exit(1);
+}
+
+const DATA_FILE = './queues.json';
+
+function loadQueues() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return {};
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    return JSON.parse(raw || '{}');
+  } catch (err) {
+    console.error('Failed to load queues:', err);
+    return {};
+  }
+}
+
+function saveQueues(qs) {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(qs, null, 2));
+  } catch (err) {
+    console.error('Failed to save queues:', err);
+  }
+}
+
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  partials: [Partials.Channel]
 });
 
-// In-memory queues: map messageId -> { name, channelId, guildId, ownerId, list: [userId] }
-const queues = new Map();
+let queues = loadQueues(); // { queueId: { ... } }
 
-function buildQueueEmbed(q) {
+function makeEmbed(q) {
   const embed = new EmbedBuilder()
     .setTitle(`คิว: ${q.name}`)
     .setColor(0x00AE86)
-    .setFooter({ text: `สร้างโดย: <@${q.ownerId}> • ผู้ใช้ในคิว: ${q.list.length}` })
     .setTimestamp();
 
+  embed.setFooter({ text: `สร้างโดย: <@${q.ownerId}> • สถานะ: ${q.isOpen ? 'เปิด' : 'ปิด'} • ผู้ในคิว: ${q.list.length}/${q.maxSlots}` });
+
+  const desc = [];
+  if (q.message) desc.push(q.message);
+  desc.push('\n');
   if (q.list.length === 0) {
-    embed.setDescription('ยังไม่มีผู้เข้าคิว — กดปุ่ม "Join" เพื่อเข้าคิว');
+    desc.push('ยังไม่มีผู้เข้าคิว');
   } else {
-    const lines = q.list.map((id, i) => `${i + 1}. <@${id}>`);
-    embed.setDescription(lines.join('\n'));
+    q.list.forEach((id, i) => {
+      desc.push(`${i + 1}. <@${id}>`);
+    });
   }
+  embed.setDescription(desc.join('\n'));
   return embed;
 }
 
-function buildActionRow(messageId) {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`join:${messageId}`)
-      .setLabel('Join')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`leave:${messageId}`)
-      .setLabel('Leave')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`next:${messageId}`)
-      .setLabel('Next')
-      .setStyle(ButtonStyle.Danger)
-  );
+function makeButtons(q) {
+  const disabled = !q.isOpen;
+  const join = new ButtonBuilder().setCustomId(`join_${q.id}`).setLabel('เข้าคิว').setStyle(ButtonStyle.Success).setDisabled(disabled);
+  const leave = new ButtonBuilder().setCustomId(`leave_${q.id}`).setLabel('ยกเลิก').setStyle(ButtonStyle.Secondary).setDisabled(false);
+  const cancel = new ButtonBuilder().setCustomId(`cancel_${q.id}`).setLabel('ยกเลิกคิว').setStyle(ButtonStyle.Danger).setDisabled(false);
+  const row = new ActionRowBuilder().addComponents(join, leave, cancel);
   return row;
 }
 
-client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-  const prefix = '!queue';
-  if (!message.content.startsWith(prefix)) return;
-
-  const args = message.content.slice(prefix.length).trim().split(/\s+/);
-  const cmd = args.shift()?.toLowerCase();
-
-  if (cmd === 'create') {
-    const name = args.join(' ') || 'default';
-    // Create placeholder embed & buttons; we need message.id to put into customIds,
-    // so first send a temporary message then edit it with proper customIds.
-    const temp = await message.channel.send({ content: 'กำลังสร้างคิว...' });
-
-    // Initialize queue entry
-    const q = { name, channelId: message.channel.id, guildId: message.guild.id, ownerId: message.author.id, list: [] };
-    queues.set(temp.id, q);
-
-    const embed = buildQueueEmbed(q);
-    const row = buildActionRow(temp.id);
-
-    await temp.edit({ content: null, embeds: [embed], components: [row] });
-    await message.reply({ content: `สร้างคิว "${name}" เรียบร้อยแล้ว` });
-  }
-
-  if (cmd === 'status') {
-    // แสดงสถานะคิวในข้อความที่อ้างถึง (optional)
-    const ref = message.reference;
-    if (!ref) {
-      message.reply('ใช้การอ้างถึงข้อความของคิว หรือส่งคำสั่งในช่องที่มีคิว');
-      return;
-    }
-    const msgId = ref.messageId;
-    const q = queues.get(msgId);
-    if (!q) {
-      message.reply('ไม่พบคิวจากข้อความที่อ้างถึง');
-      return;
-    }
-    const embed = buildQueueEmbed(q);
-    message.channel.send({ embeds: [embed] });
-  }
-
-  // เพิ่มคำสั่ง next แบบใช้ข้อความ (สำหรับกรณีผู้ใช้ไม่ต้องการปุ่ม)
-  if (cmd === 'next') {
-    // ค้นหาคิวที่ผู้ใช้สร้างไว้ในช่องนี้
-    const found = Array.from(queues.entries()).map(([id, q]) => ({ id, q })).find(x => x.q.channelId === message.channel.id);
-    if (!found) {
-      message.reply('ไม่พบคิวในช่องนี้');
-      return;
-    }
-    const { id: msgId, q } = found;
-    // ตรวจสิทธิ์: เจ้าของคิว หรือผู้มี ManageGuild
-    if (message.author.id !== q.ownerId && !message.member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
-      message.reply('ไม่มีสิทธิ์เรียกคนถัดไป (ต้องเป็นเจ้าของคิวหรือมี Manage Guild)');
-      return;
-    }
-    if (q.list.length === 0) {
-      message.reply('คิวว่างแล้ว');
-      return;
-    }
-    const nextUser = q.list.shift(); // นำคนแรกออก
-    // แจ้งผล
-    message.channel.send(`เรียกคิว: <@${nextUser}>`);
-    // อัพเดต embed ที่เป็นข้อความคิว
-    try {
-      const queueMessage = await message.channel.messages.fetch(msgId);
-      const embed = buildQueueEmbed(q);
-      const row = buildActionRow(msgId);
-      await queueMessage.edit({ embeds: [embed], components: [row] });
-    } catch (err) {
-      console.error('ไม่สามารถอัปเดตข้อความคิว:', err);
-    }
-  }
-});
-
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isButton()) return;
-  const [action, messageId] = interaction.customId.split(':');
-  const q = queues.get(messageId);
-  if (!q) {
-    await interaction.reply({ content: 'คิวไม่พบหรือหมดอายุ', ephemeral: true });
+async function scheduleOpen(q) {
+  // ensure not already opened
+  if (q.isOpen) return;
+  const now = Date.now();
+  if (q.startAt <= now) {
+    // open immediately
+    q.isOpen = true;
+    saveQueues(queues);
+    await updateQueueMessage(q);
     return;
   }
-
-  const userId = interaction.user.id;
-
-  if (action === 'join') {
-    if (q.list.includes(userId)) {
-      await interaction.reply({ content: 'คุณอยู่ในคิวแล้ว', ephemeral: true });
+  const delay = q.startAt - now;
+  setTimeout(async () => {
+    // if already closed by being full, do nothing
+    if (q.isOpen) return;
+    if (q.list.length >= q.maxSlots) {
+      q.isOpen = false;
+      saveQueues(queues);
+      await updateQueueMessage(q);
       return;
     }
-    q.list.push(userId);
-    // update embed
-    const embed = buildQueueEmbed(q);
-    const row = buildActionRow(messageId);
-    await interaction.update({ embeds: [embed], components: [row] });
+    q.isOpen = true;
+    saveQueues(queues);
+    await updateQueueMessage(q);
+  }, delay);
+}
+
+async function updateQueueMessage(q) {
+  try {
+    const channel = await client.channels.fetch(q.channelId);
+    if (!channel) return;
+    const msg = await channel.messages.fetch(q.messageId);
+    if (!msg) return;
+    await msg.edit({ embeds: [makeEmbed(q)], components: [makeButtons(q)] });
+  } catch (err) {
+    console.error('Failed to update queue message:', err);
   }
+}
 
-  if (action === 'leave') {
-    const idx = q.list.indexOf(userId);
-    if (idx === -1) {
-      await interaction.reply({ content: 'คุณไม่ได้อยู่ในคิว', ephemeral: true });
-      return;
-    }
-    q.list.splice(idx, 1);
-    const embed = buildQueueEmbed(q);
-    const row = buildActionRow(messageId);
-    await interaction.update({ embeds: [embed], components: [row] });
-  }
-
-  if (action === 'next') {
-    // ตรวจสิทธิ์: เจ้าของคิว หรือผู้มี ManageGuild
-    const member = await interaction.guild.members.fetch(userId);
-    const isAdmin = member.permissions.has(PermissionsBitField.Flags.ManageGuild);
-    if (interaction.user.id !== q.ownerId && !isAdmin) {
-      await interaction.reply({ content: 'คุณไม่มีสิทธิ์เรียกคนถัดไป', ephemeral: true });
-      return;
-    }
-    if (q.list.length === 0) {
-      await interaction.reply({ content: 'คิวว่างแล้ว', ephemeral: true });
-      return;
-    }
-    const nextUser = q.list.shift();
-    // แจ้งในช่องว่าเรียกใคร
-    try {
-      const queueMessage = await interaction.channel.messages.fetch(messageId);
-      const embed = buildQueueEmbed(q);
-      const row = buildActionRow(messageId);
-      await queueMessage.edit({ embeds: [embed], components: [row] });
-      await interaction.reply({ content: `เรียกคิว: <@${nextUser}>` });
-    } catch (err) {
-      console.error('ไม่สามารถอัปเดตข้อความคิว:', err);
-      await interaction.reply({ content: 'เกิดข้อผิดพลาดในการเรียกคิว', ephemeral: true });
+client.once(Events.ClientReady, async () => {
+  console.log(`Ready as ${client.user.tag}`);
+  // schedule pending queues
+  for (const id of Object.keys(queues)) {
+    const q = queues[id];
+    // if queue was open already, ensure buttons enabled
+    if (q.isOpen) {
+      updateQueueMessage(q);
+    } else {
+      scheduleOpen(q);
     }
   }
 });
 
-client.once('ready', () => {
-  console.log(`Ready: ${client.user.tag}`);
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (interaction.isCommand()) {
+      if (interaction.commandName === 'reserve') {
+        const name = interaction.options.getString('name');
+        const maxSlots = interaction.options.getInteger('max_slots');
+        const startIn = interaction.options.getInteger('start_in_minutes') || 0;
+        const message = interaction.options.getString('message') || '';
+        const startAt = Date.now() + startIn * 60 * 1000;
+
+        // create queue object
+        const id = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        const q = {
+          id,
+          guildId: interaction.guildId,
+          channelId: interaction.channelId,
+          messageId: null,
+          ownerId: interaction.user.id,
+          name,
+          message,
+          maxSlots,
+          startAt,
+          isOpen: false,
+          list: []
+        };
+
+        // send initial message with disabled buttons (if startIn > 0) or enabled when startIn === 0
+        const sent = await interaction.reply({ embeds: [makeEmbed(q)], components: [makeButtons(q)], fetchReply: true });
+        q.messageId = sent.id;
+        queues[q.id] = q;
+        saveQueues(queues);
+
+        // schedule open
+        if (startIn <= 0) {
+          q.isOpen = true;
+          saveQueues(queues);
+          await updateQueueMessage(q);
+        } else {
+          scheduleOpen(q);
+        }
+
+        await interaction.followUp({ content: `สร้างคิว "${name}" เรียบร้อย (เปิดรับใน ${startIn} นาที)`, ephemeral: true });
+      }
+    } else if (interaction.isButton()) {
+      const [action, qid] = interaction.customId.split('_');
+      const q = queues[qid];
+      if (!q) {
+        await interaction.reply({ content: 'ไม่พบคิวหรือคิวหมดอายุ', ephemeral: true });
+        return;
+      }
+
+      if (action === 'join') {
+        if (!q.isOpen) {
+          await interaction.reply({ content: 'ยังไม่เปิดรับ หรือคิวปิดแล้ว', ephemeral: true });
+          return;
+        }
+        if (q.list.includes(interaction.user.id)) {
+          await interaction.reply({ content: `คุณอยู่ในคิวแล้ว ตำแหน่งของคุณ: ${q.list.indexOf(interaction.user.id) + 1}`, ephemeral: true });
+          return;
+        }
+        if (q.list.length >= q.maxSlots) {
+          q.isOpen = false;
+          saveQueues(queues);
+          await updateQueueMessage(q);
+          await interaction.reply({ content: 'คิวเต็มแล้ว', ephemeral: true });
+          return;
+        }
+        q.list.push(interaction.user.id);
+        saveQueues(queues);
+        await updateQueueMessage(q);
+        await interaction.reply({ content: `จองเรียบร้อย คุณเป็นคิวที่ ${q.list.length}`, ephemeral: true });
+
+        // if reached max, close immediately
+        if (q.list.length >= q.maxSlots) {
+          q.isOpen = false;
+          saveQueues(queues);
+          await updateQueueMessage(q);
+          try {
+            const channel = await client.channels.fetch(q.channelId);
+            await channel.send(`คิว "${q.name}" ถูกปิดโดยอัตโนมัติเนื่องจากคนเต็ม`);
+          } catch (e) { /* ignore */ }
+        }
+      } else if (action === 'leave') {
+        const idx = q.list.indexOf(interaction.user.id);
+        if (idx === -1) {
+          await interaction.reply({ content: 'คุณไม่ได้อยู่ในคิว', ephemeral: true });
+          return;
+        }
+        q.list.splice(idx, 1);
+        saveQueues(queues);
+        await updateQueueMessage(q);
+        await interaction.reply({ content: 'คุณได้ออกจากคิวแล้ว', ephemeral: true });
+      } else if (action === 'cancel') {
+        // only owner can cancel
+        if (interaction.user.id !== q.ownerId) {
+          await interaction.reply({ content: 'เฉพาะผู้สร้างคิวเท่านั้นที่ยกเลิกได้', ephemeral: true });
+          return;
+        }
+        // edit message to disabled and mark closed
+        q.isOpen = false;
+        saveQueues(queues);
+        await updateQueueMessage(q);
+        await interaction.reply({ content: 'ยกเลิกคิวเรียบร้อย', ephemeral: true });
+      }
+    }
+  } catch (err) {
+    console.error('Interaction handler error:', err);
+    if (interaction && !interaction.replied) {
+      try { await interaction.reply({ content: 'เกิดข้อผิดพลาด', ephemeral: true }); } catch (e) {}
+    }
+  }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(token);
